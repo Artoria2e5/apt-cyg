@@ -23,9 +23,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 # THE SOFTWARE.
 
-if [ ${BASH_VERSINFO}${BASH_VERSINFO[1]} -lt 42 ]
+if (( BASH_VERSINFO < 4 || (BASH_VERSINFO == 4 && BASH_VERSINFO[1] < 3) ))
 then
-  echo 'Bash version 4.2+ required'
+  echo 'Bash version 4.3+ required'
   exit
 fi
 
@@ -118,6 +118,10 @@ The MIT License (MIT)
 Copyright (c) 2005-9 Stephen Jungels
 "
 
+# Absolute path of the master package list; find-workspace replaces it.  Awk
+# reads use this because the working directory changes during install.
+setup_ini=setup.ini
+
 function wget {
   if command wget -h &>/dev/null
   then
@@ -155,7 +159,8 @@ function find-workspace {
   ' <<< "$mirror")
 
   mkdir -p "$cache/$mirrordir/$arch"
-  cd "$cache/$mirrordir/$arch"
+  cd "$cache/$mirrordir/$arch" || return 1
+  setup_ini=$PWD/setup.ini
   if [ -e setup.ini ]
   then
     return 0
@@ -168,7 +173,7 @@ function find-workspace {
 function get-setup {
   touch setup.ini
   mv setup.ini setup.ini-save
-  wget -N $mirror/$arch/setup.bz2
+  wget -N "$mirror"/"$arch"/setup.bz2
   if [ -e setup.bz2 ]
   then
     bunzip2 setup.bz2
@@ -213,7 +218,7 @@ function apt-category {
     $1 == "category:" && $0 ~ query {
       print pck
     }
-    ' query="$pks" setup.ini
+    ' query="$pks" "$setup_ini"
   done
 }
 
@@ -221,10 +226,10 @@ function apt-list {
   local sbq
   for pkg in "${pks[@]}"
   do
-    let sbq++ && echo
+    (( sbq++ )) && echo
     awk 'NR>1 && $1~pkg && $0=$1' pkg="$pkg" /etc/setup/installed.db
   done
-  let sbq && return
+  (( sbq )) && return
   awk 'NR>1 && $0=$1' /etc/setup/installed.db
 }
 
@@ -234,8 +239,8 @@ function apt-listall {
   local sbq
   for pkg in "${pks[@]}"
   do
-    let sbq++ && echo
-    awk '$1~pkg && $0=$1' RS='\n\n@ ' FS='\n' pkg="$pkg" setup.ini
+    (( sbq++ )) && echo
+    awk '$1~pkg && $0=$1' RS='\n\n@ ' FS='\n' pkg="$pkg" "$setup_ini"
   done
 }
 
@@ -269,8 +274,97 @@ function apt-show {
       if (! fd)
         print "Unable to locate package " query
     }
-    ' RS='\n\n@ ' FS='\n' query="$pkg" setup.ini
+    ' RS='\n\n@ ' FS='\n' query="$pkg" "$setup_ini"
   done
+}
+
+# Dependency parsing.
+#
+# setup.ini used to list dependencies as
+#   requires: a b c
+# and now lists them as
+#   depends2: a, b ( >= 6.3 ), c
+# Both spellings are understood.  Version constraints are dropped (apt-cyg
+# installs the newest version anyway) and virtual packages such as _windows are
+# skipped because they cannot be installed.
+
+# Print "package dependency dependency..." lines, or with $1 set to "reverse"
+# the inverted "dependency package package..." lines.  Grouping here keeps the
+# bash side to one assignment per package instead of one per edge.
+function dependency-lines {
+  awk -v rev="$1" '
+  $1 == "@" { pkg = $2; next }
+  $1 == "[prev]" { pkg = ""; next }
+  pkg == "" { next }
+  $1 != "requires:" && $1 != "depends2:" { next }
+  {
+    line = $0
+    if ($1 == "requires:") {
+      sub(/^requires:[ \t]*/, "", line)
+      n = split(line, a, /[ \t]+/)
+    } else {
+      sub(/^depends2:[ \t]*/, "", line)
+      n = split(line, a, ",")
+    }
+    for (i = 1; i <= n; i++) {
+      d = a[i]
+      sub(/[ \t]*\(.*/, "", d)
+      gsub(/^[ \t]+|[ \t]+$/, "", d)
+      if (d == "" || d ~ /^_/) continue
+      if (rev)
+        map[d] = map[d] " " pkg
+      else
+        map[pkg] = map[pkg] " " d
+    }
+  }
+  END { for (k in map) print k map[k] }' "$setup_ini"
+}
+
+# Fill reqs[pkg] with its space separated dependencies.  Reading 16k lines with
+# bash read costs seconds here (Cygwin spends ~140us per line), so awk prints
+# one assignment per package and eval runs them as a single command.  Anything
+# that is not a plain package name is dropped instead of reaching eval.
+declare -A reqs
+function load-dependencies {
+  eval "$(dependency-lines | awk '
+  {
+    key = $1
+    sub(/^[^ ]+ /, "")
+    if (key !~ /^[A-Za-z0-9._+-]+$/ || $0 ~ /["\\$`]/)
+      next
+    print "reqs[" key "]=\"" $0 "\""
+  }')"
+}
+
+# Walk the map printed by dependency-lines and print the tree of $1, joining
+# levels with $2.  The map lives in awk only, so walking costs no per-node
+# bash call (the recursive bash walker took ~8s on the perl tree).
+function dep-walk {
+  awk -v root="$1" -v sep="$2" '
+  {
+    key = $1
+    sub(/^[^ ]+ /, "")
+    kids[key] = $0
+  }
+  function walk(node, prefix,   line, i, n, c, d) {
+    if (node in onpath)
+      return
+    onpath[node] = 1
+    line = (prefix == "") ? node : prefix sep node
+    print line
+    n = split(kids[node], c, " ")
+    for (i = 1; i <= n; i++)
+      if (c[i] != "")
+        walk(c[i], line)
+    delete onpath[node]
+  }
+  END { walk(root, "") }'
+}
+
+# Print the dependency tree of $1.  $2 is the separator; when $3 is set the
+# tree is walked upwards through reverse dependencies instead.
+function dep-tree {
+  dependency-lines "$3" | dep-walk "$1" "$2"
 }
 
 function apt-depends {
@@ -278,73 +372,23 @@ function apt-depends {
   check-packages
   for pkg in "${pks[@]}"
   do
-    awk '
-    @include "join"
-    $1 == "@" {
-      apg = $2
-    }
-    $1 == "requires:" {
-      for (z=2; z<=NF; z++)
-        reqs[apg][z-1] = $z
-    }
-    END {
-      prpg(ENVIRON["pkg"])
-    }
-    function smartmatch(small, large,    values) {
-      for (each in large)
-        values[large[each]]
-      return small in values
-    }
-    function prpg(fpg) {
-      if (smartmatch(fpg, spath)) return
-      spath[length(spath)+1] = fpg
-      print join(spath, 1, length(spath), " > ")
-      if (isarray(reqs[fpg]))
-        for (each in reqs[fpg])
-          prpg(reqs[fpg][each])
-      delete spath[length(spath)]
-    }
-    ' setup.ini
+    dep-tree "$pkg" " > "
   done
 }
 
 function apt-rdepends {
   find-workspace
+  check-packages
   for pkg in "${pks[@]}"
   do
-    awk '
-    @include "join"
-    $1 == "@" {
-      apg = $2
-    }
-    $1 == "requires:" {
-      for (z=2; z<=NF; z++)
-        reqs[$z][length(reqs[$z])+1] = apg
-    }
-    END {
-      prpg(ENVIRON["pkg"])
-    }
-    function smartmatch(small, large,    values) {
-      for (each in large)
-        values[large[each]]
-      return small in values
-    }
-    function prpg(fpg) {
-      if (smartmatch(fpg, spath)) return
-      spath[length(spath)+1] = fpg
-      print join(spath, 1, length(spath), " < ")
-      if (isarray(reqs[fpg]))
-        for (each in reqs[fpg])
-          prpg(reqs[fpg][each])
-      delete spath[length(spath)]
-    }
-    ' setup.ini
+    dep-tree "$pkg" " < " reverse
   done
 }
 
 function apt-download {
   check-packages
   find-workspace
+  prefetch "${pks[@]}"
   local pkg sbq
   for pkg in "${pks[@]}"
   do
@@ -354,20 +398,21 @@ function apt-download {
 }
 
 function download {
-  local pkg digest digactual
+  local pkg digest
   pkg=$1
   # look for package and save desc file
 
-  awk '$1 == pc' RS='\n\n@ ' FS='\n' pc=$pkg setup.ini > desc
+  awk '$1 == pc' RS='\n\n@ ' FS='\n' pc="$pkg" "$setup_ini" > desc
   if [ ! -s desc ]
   then
-    echo Unable to locate package $pkg
+    echo Unable to locate package "$pkg"
     exit 1
   fi
 
   # download and unpack the bz2 or xz file
 
   # pick the latest version, which comes first
+  # shellcheck disable=SC2046  # splitting the fields is the point
   set -- $(awk '$1 == "install:"' desc)
   if (( ! $# ))
   then
@@ -375,8 +420,8 @@ function download {
     exit 1
   fi
 
-  dn=$(dirname $2)
-  bn=$(basename $2)
+  dn=$(dirname "$2")
+  bn=$(basename "$2")
 
   # check the md5
   digest=$4
@@ -385,17 +430,76 @@ function download {
   128) hash=sha512sum ;;
   esac
   mkdir -p "$cache/$mirrordir/$dn"
-  cd "$cache/$mirrordir/$dn"
-  if ! test -e $bn || ! $hash -c <<< "$digest $bn"
+  cd "$cache/$mirrordir/$dn" || exit 1
+  if ! test -e "$bn" || ! $hash -c <<< "$digest $bn"
   then
-    wget -O $bn $mirror/$dn/$bn
+    wget -O "$bn" "$mirror"/"$dn"/"$bn"
     $hash -c <<< "$digest $bn" || exit
   fi
 
-  tar tf $bn | gzip > /etc/setup/"$pkg".lst.gz
-  cd ~-
+  tar tf "$bn" | gzip > /etc/setup/"$pkg".lst.gz
+  cd ~- || exit 1
   mv desc "$cache/$mirrordir/$dn"
-  echo $dn $bn > /tmp/dwn
+  echo "$dn $bn" > /tmp/dwn
+}
+
+# Download and verify one package tarball.  Needs no shared state, so it can
+# be run in the background; it never touches installed.db or the cwd.
+function fetch {
+  local pkg=$1 desc dn bn digest hash
+  (
+    desc=$(awk '$1 == pc' RS='\n\n@ ' FS='\n' pc="$pkg" "$setup_ini")
+    if [[ ! $desc ]]
+    then
+      echo Unable to locate package "$pkg" >&2
+      exit 1
+    fi
+    # shellcheck disable=SC2046
+    set -- $(awk '$1 == "install:"' <<< "$desc")
+    if (( ! $# ))
+    then
+      echo 'Could not find "install" in package description: obsolete package?' >&2
+      exit 1
+    fi
+    dn=$(dirname "$2")
+    bn=$(basename "$2")
+    digest=$4
+    case ${#digest} in
+      32) hash=md5sum    ;;
+    128) hash=sha512sum ;;
+    esac
+    mkdir -p "$cache/$mirrordir/$dn"
+    cd "$cache/$mirrordir/$dn" || exit 1
+    if ! test -e "$bn" || ! $hash -c <<< "$digest $bn"
+    then
+      wget -O "$bn" "$mirror"/"$dn"/"$bn"
+      $hash -c <<< "$digest $bn" || exit 1
+    fi
+  )
+}
+
+# Fetch the tarballs of the given packages, four at a time.  Packages already in
+# installed.db are skipped.  "wait -n" lets a slot be refilled as soon as any
+# download finishes instead of waiting for a whole batch.
+function prefetch {
+  local -a todo=()
+  local p running=0 pool=4
+  for p in "$@"
+  do
+    grep -q "^$p " /etc/setup/installed.db && continue
+    todo+=("$p")
+  done
+  for p in "${todo[@]}"
+  do
+    fetch "$p" &
+    (( running++ ))
+    if (( running >= pool ))
+    then
+      wait -n
+      (( running-- ))
+    fi
+  done
+  wait
 }
 
 function apt-search {
@@ -407,23 +511,23 @@ function apt-search {
     [[ $key ]] || key=$pkg
     for manifest in /etc/setup/*.lst.gz
     do
-      if gzip -cd $manifest | grep -q "$key"
+      if gzip -cd "$manifest" | grep -q "$key"
       then
         package=$(sed '
         s,/etc/setup/,,
         s,.lst.gz,,
-        ' <<< $manifest)
-        echo $package
+        ' <<< "$manifest")
+        echo "$package"
       fi
     done
   done
 }
 
 function apt-searchall {
-  cd /tmp
+  cd /tmp || exit 1
   for pkg in "${pks[@]}"
   do
-    printf -v qs 'text=1&arch=%s&grep=%s' $arch "$pkg"
+    printf -v qs 'text=1&arch=%s&grep=%s' "$arch" "$pkg"
     wget -O matches cygwin.com/cgi-bin2/package-grep.cgi?"$qs"
     awk '
     NR == 1 {next}
@@ -438,24 +542,26 @@ function apt-searchall {
 function apt-install {
   check-packages
   find-workspace
-  local pkg dn bn requires wr package sbq script
+  load-dependencies
+  prefetch "${pks[@]}"
+  local pkg dn bn wr package sbq script
   for pkg in "${pks[@]}"
   do
 
   if grep -q "^$pkg " /etc/setup/installed.db
   then
-    echo Package $pkg is already installed, skipping
+    echo Package "$pkg" is already installed, skipping
     continue
   fi
   (( sbq++ )) && echo
-  echo Installing $pkg
+  echo Installing "$pkg"
 
-  download $pkg
-  read dn bn </tmp/dwn
+  download "$pkg"
+  read -r dn bn </tmp/dwn
   echo Unpacking...
 
-  cd "$cache/$mirrordir/$dn"
-  tar -x -C / -f $bn
+  cd "$cache/$mirrordir/$dn" || exit 1
+  tar -x -C / -f "$bn"
   # update the package database
 
   awk '
@@ -467,28 +573,30 @@ function apt-install {
   END {
     if (ins != 1) print pkg, bz, 0
   }
-  ' pkg="$pkg" bz=$bn /etc/setup/installed.db > /tmp/awk.$$
+  ' pkg="$pkg" bz="$bn" /etc/setup/installed.db > /tmp/awk.$$
   mv /etc/setup/installed.db /etc/setup/installed.db-save
   mv /tmp/awk.$$ /etc/setup/installed.db
 
   [ -v nodeps ] && continue
   # recursively install required packages
 
-  requires=$(awk '$1=="requires", $0=$2' FS=': ' desc)
-  cd ~-
+  local -a requires
+  IFS=' ' read -r -a requires <<< "${reqs[$pkg]}"
+  prefetch "${requires[@]}"
+  cd ~- || exit 1
   wr=0
-  if [[ $requires ]]
+  if (( ${#requires[@]} ))
   then
-    echo Package $pkg requires the following packages, installing:
-    echo $requires
-    for package in $requires
+    echo Package "$pkg" requires the following packages, installing:
+    echo "${requires[*]}"
+    for package in "${requires[@]}"
     do
       if grep -q "^$package " /etc/setup/installed.db
       then
-        echo Package $package is already installed, skipping
+        echo Package "$package" is already installed, skipping
         continue
       fi
-      apt-cyg install --noscripts $package || (( wr++ ))
+      apt-cyg install --noscripts "$package" || (( wr++ ))
     done
   fi
   if (( wr ))
@@ -499,33 +607,33 @@ function apt-install {
   # run all postinstall scripts
 
   [ -v noscripts ] && continue
-  find /etc/postinstall -name '*.sh' | while read script
+  find /etc/postinstall -name '*.sh' | while read -r script
   do
-    echo Running $script
+    echo Running "$script"
     $script
-    mv $script $script.done
+    mv "$script" "$script".done
   done
-  echo Package $pkg installed
+  echo Package "$pkg" installed
 
   done
 }
 
 function apt-remove {
   check-packages
-  cd /etc
+  cd /etc || exit 1
   cygcheck awk bash bunzip2 grep gzip mv sed tar xz > setup/essential.lst
   for pkg in "${pks[@]}"
   do
 
   if ! grep -q "^$pkg " setup/installed.db
   then
-    echo Package $pkg is not installed, skipping
+    echo Package "$pkg" is not installed, skipping
     continue
   fi
 
   if [ ! -e setup/"$pkg".lst.gz ]
   then
-    warn Package manifest missing, cannot remove $pkg. Exiting
+    warn Package manifest missing, cannot remove "$pkg". Exiting
     exit 1
   fi
   gzip -dk setup/"$pkg".lst.gz
@@ -537,33 +645,33 @@ function apt-remove {
   $NF in ess {
     exit 1
   }
-  ' FS='[/\\\\]' setup/{essential,$pkg}.lst
+  ' FS='[/\\\\]' setup/{essential,"$pkg"}.lst
   esn=$?
   if [ $esn = 0 ]
   then
-    echo Removing $pkg
+    echo Removing "$pkg"
     if [ -e preremove/"$pkg".sh ]
     then
       preremove/"$pkg".sh
       rm preremove/"$pkg".sh
     fi
-    mapfile dt < setup/"$pkg".lst
-    for each in ${dt[*]}
+    mapfile -t dt < setup/"$pkg".lst
+    for each in "${dt[@]}"
     do
-      [ -f /$each ] && rm /$each
+      [ -f "/$each" ] && rm "/$each"
     done
-    for each in ${dt[*]}
+    for each in "${dt[@]}"
     do
-      [ -d /$each ] && rmdir --i /$each
+      [ -d "/$each" ] && rmdir --i "/$each"
     done
     rm -f setup/"$pkg".lst.gz postinstall/"$pkg".sh.done
     awk -i inplace '$1 != ENVIRON["pkg"]' setup/installed.db
-    echo Package $pkg removed
+    echo Package "$pkg" removed
   fi
   rm setup/"$pkg".lst
   if [ $esn = 1 ]
   then
-    warn apt-cyg cannot remove package $pkg, exiting
+    warn apt-cyg cannot remove package "$pkg", exiting
     exit 1
   fi
 
@@ -634,7 +742,7 @@ do
     ;;
 
     --version)
-      printf "$version"
+      printf %s "$version"
       exit
     ;;
 
@@ -664,10 +772,10 @@ done
 
 set -a
 
-if type -t apt-$command | grep -q function
+if type -t apt-"$command" | grep -q function
 then
   readonly arch=${HOSTTYPE/i6/x}
-  apt-$command
+  apt-"$command"
 else
-  printf "$usage"
+  printf %s "$usage"
 fi
